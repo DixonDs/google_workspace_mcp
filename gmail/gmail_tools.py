@@ -32,6 +32,7 @@ from pydantic import Field
 from auth.service_decorator import require_google_service
 from core.utils import handle_http_errors
 from core.server import server
+from core.visual_rendering import render_document_page, convert_html_to_pdf, convert_pdf_to_images
 from auth.scopes import (
     GMAIL_SEND_SCOPE,
     GMAIL_COMPOSE_SCOPE,
@@ -875,6 +876,96 @@ def _create_archival_html(headers: dict, body_html: str) -> str:
     return html_template
 
 
+def _stitch_images(images: list) -> "Image.Image":
+    """
+    Stitches a list of PIL Images vertically into a single image.
+    """
+    if not images:
+        raise ValueError("No images to stitch.")
+
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError("pillow is required for image stitching.")
+
+    if len(images) == 1:
+        return images[0]
+
+    total_width = max(img.width for img in images)
+    total_height = sum(img.height for img in images)
+    final_image = Image.new('RGB', (total_width, total_height), 'white')
+
+    y_offset = 0
+    for img in images:
+        final_image.paste(img, (0, y_offset))
+        y_offset += img.height
+
+    return final_image
+
+
+async def _get_printable_html(service, message_id: str) -> str:
+    """
+    Helper helper helper to generate print-ready HTML for a Gmail message.
+    """
+    # 1. Fetch Full Payload
+    message_full = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute
+    )
+    payload = message_full.get("payload", {})
+
+    # 2. Extract HTML
+    bodies = _extract_message_bodies(payload)
+    html_body = bodies.get("html", "") or f"<pre>{bodies.get('text', '')}</pre>"
+
+    # 3. Always Embed Images (CID -> Data URI)
+    html_body = await asyncio.to_thread(
+        _embed_inline_images, html_body, payload, service, message_id
+    )
+
+    # 4. Get all headers for display
+    all_headers = _extract_headers(payload, GMAIL_METADATA_HEADERS)
+
+    # 5. Wrap in viewer template
+    final_html = _create_archival_html(all_headers, html_body)
+    return final_html
+
+
+@server.tool()
+@handle_http_errors("get_gmail_message_visual", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def get_gmail_message_visual(
+    service,
+    user_google_email: str,
+    message_id: str,
+    page_number: int = 1,
+    max_dimension: int = None
+) -> list:
+    """
+    Visually inspects a Gmail message by rendering it as a PDF image.
+    Useful for multimodal agents to 'see' the email layout.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        message_id (str): The unique ID of the Gmail message.
+        page_number (int): The page number to render (default 1).
+        max_dimension (int): Optional maximum width or height of the returned image.
+
+    Returns:
+        list: A list containing an Image and Text metadata.
+    """
+    logger.info(f"[get_gmail_message_visual] Message ID: {message_id}, Page: {page_number}, Max Dim: {max_dimension}")
+
+    final_html = await _get_printable_html(service, message_id)
+
+    # Render to PDF bytes
+    pdf_bytes = await convert_html_to_pdf(final_html)
+
+    return render_document_page(pdf_bytes, page_number, max_dimension=max_dimension)
+
+
 @server.tool()
 @handle_http_errors("export_gmail_message", is_read_only=True, service_type="gmail")
 @require_google_service("gmail", "gmail_read")
@@ -953,83 +1044,38 @@ async def export_gmail_message(
 
     else:
         # HTML/PDF/PNG Export: Use Archival format with embedded images
-        # 1. Fetch Full Payload
-        message_full = await asyncio.to_thread(
-            service.users()
-            .messages()
-            .get(userId="me", id=message_id, format="full")
-            .execute
-        )
-        payload = message_full.get("payload", {})
+        final_html = await _get_printable_html(service, message_id)
 
-        # 2. Extract HTML
-        bodies = _extract_message_bodies(payload)
-        html_body = bodies.get("html", "") or f"<pre>{bodies.get('text', '')}</pre>"
-        
-        # 3. Always Embed Images (CID -> Data URI)
-        # This is critical for single-file HTML and WeasyPrint
-        html_body = await asyncio.to_thread(
-            _embed_inline_images, html_body, payload, service, message_id
-        )
-
-        # 4. Get all headers for display
-        all_headers = _extract_headers(payload, GMAIL_METADATA_HEADERS)
-
-        # 5. Wrap in viewer template
-        final_html = _create_archival_html(all_headers, html_body)
         
         if format == "html":
             with open(final_path, "w", encoding="utf-8") as f:
                 f.write(final_html)
 
         elif format == "pdf":
-            try:
-                import weasyprint
-            except ImportError:
-                raise ImportError("weasyprint is required for PDF export. Please install it.")
-
             # WeasyPrint to PDF
-            # Use asyncio.to_thread because weasyprint can be slow/blocking
-            await asyncio.to_thread(
-                weasyprint.HTML(string=final_html).write_pdf, final_path, presentational_hints=True
-            )
-
+            pdf_bytes = await convert_html_to_pdf(final_html)
+            with open(final_path, "wb") as f:
+                f.write(pdf_bytes)
+            
         elif format == "png":
             try:
-                import weasyprint
-                from pdf2image import convert_from_bytes
                 from PIL import Image
             except ImportError:
-                raise ImportError("weasyprint, pdf2image, and pillow are required for PNG export.")
+                raise ImportError("pillow is required for PNG export.")
 
             # 1. Render to PDF bytes first
-            # WeasyPrint to PDF bytes
-            pdf_bytes = await asyncio.to_thread(
-                weasyprint.HTML(string=final_html).write_pdf, presentational_hints=True
-            )
-
+            pdf_bytes = await convert_html_to_pdf(final_html)
+            
             # 2. Convert PDF to Images
-            try:
-                images = await asyncio.to_thread(convert_from_bytes, pdf_bytes)
-            except Exception as e:
-                raise RuntimeError(f"Failed to convert PDF to Image. Ensure Poppler is installed. Error: {e}")
+            images = await asyncio.to_thread(convert_pdf_to_images, pdf_bytes)
 
             if not images:
                 raise RuntimeError("No images generated from PDF.")
 
             # 3. Stitch images if multiple
-            if len(images) == 1:
-                final_image = images[0]
-            else:
-                total_width = max(img.width for img in images)
-                total_height = sum(img.height for img in images)
-                final_image = Image.new('RGB', (total_width, total_height), 'white')
-
-                y_offset = 0
-                for img in images:
-                    final_image.paste(img, (0, y_offset))
-                    y_offset += img.height
-
+            # Run in thread to avoid blocking loop with large image operations
+            final_image = await asyncio.to_thread(_stitch_images, images)
+            
             # 4. Save PNG
             await asyncio.to_thread(final_image.save, final_path, format="PNG")
 

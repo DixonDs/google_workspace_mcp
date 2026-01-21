@@ -27,6 +27,7 @@ from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.utils import extract_office_xml_text, handle_http_errors
 from core.server import server
 from core.config import get_transport_mode
+from core.visual_rendering import render_document_page, render_image
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
     build_drive_list_params,
@@ -209,6 +210,86 @@ async def get_drive_file_content(
         f"Link: {file_metadata.get('webViewLink', '#')}\n\n--- CONTENT ---\n"
     )
     return header + body_text
+
+
+@server.tool()
+@handle_http_errors("get_drive_file_visual", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def get_drive_file_visual(
+    service,
+    user_google_email: str,
+    file_id: str,
+    page_number: int = 1,
+    max_dimension: int = None
+) -> list:
+    """
+    Visually inspects a Google Drive file by rendering it as an image.
+    Supports PDF, Google Docs/Sheets/Slides (converted to PDF), and Image files.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The Google Drive file ID.
+        page_number (int): The page number to render (default 1). For images, this is ignored (always 1).
+        max_dimension (int): Optional maximum width or height of the returned image.
+    
+    Returns:
+        list: A list containing FastMCP Image object and text metadata.
+    """
+    logger.info(f"[get_drive_file_visual] File ID: {file_id}, Page: {page_number}, Max Dim: {max_dimension}")
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service,
+        file_id,
+        extra_fields="name, mimeType",
+    )
+    file_id = resolved_file_id
+    mime_type = file_metadata.get("mimeType", "")
+    
+    # 1. Determine download/export strategy
+    # Google Native -> Export to PDF
+    # PDF -> Download
+    # Image -> Download 
+    # Others -> Fail or try PDF download?
+    
+    export_mime_type = None
+    
+    if mime_type.startswith("application/vnd.google-apps."):
+        # Maps Docs, Sheets, Slides, Drawings to PDF
+        export_mime_type = "application/pdf"
+        # Note: Some google apps types might not support PDF export (e.g. Forms, Sites, Folders)
+        # We'll try and let the API error if not supported, or restrictive check?
+        # Docs, Sheets, Slides support it.
+    
+    # Check if image
+    is_image = mime_type.startswith("image/")
+    
+    # perform download
+    if export_mime_type:
+         request_obj = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+    else:
+         request_obj = service.files().get_media(fileId=file_id)
+         
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_obj)
+    loop = asyncio.get_event_loop()
+    done = False
+    
+    try:
+        while not done:
+            status, done = await loop.run_in_executor(None, downloader.next_chunk)
+    except HttpError as e:
+        return [f"Error downloading/exporting file: {e}"]
+
+    file_bytes = fh.getvalue()
+    
+    if is_image:
+        # Return image directly via shared helper
+        return render_image(file_bytes, mime_type=mime_type, max_dimension=max_dimension)
+    else:
+        # Assume it's a PDF (either native or exported)
+        # If it was a random binary file that isn't PDF or Image, render_document_page will likely fail or pypdf/pdf2image will fail.
+        # We can pass specific mime_type check if needed, but 'try it' is robust enough.
+        return render_document_page(file_bytes, page_number, max_dimension=max_dimension)
 
 
 @server.tool()

@@ -13,6 +13,7 @@ gmail:
     - manage_gmail_label
     - draft_gmail_message
     - export_gmail_message
+    - get_gmail_message_visual
     - list_gmail_filters
     - create_gmail_filter
     - delete_gmail_filter
@@ -39,6 +40,7 @@ drive:
     - remove_drive_permission
     - transfer_drive_ownership
     - batch_share_drive_file
+    - get_drive_file_visual
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access
@@ -193,4 +195,11 @@ appscript:
     - get_version
     - list_script_processes
     - get_script_metrics
+  complete: []
+
+system:
+  core:
+
+  extended:
+    - get_local_file_visual
   complete: []

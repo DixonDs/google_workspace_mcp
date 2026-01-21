@@ -125,6 +125,7 @@ def main():
             "contacts",
             "search",
             "appscript",
+            "system",
         ],
         help="Specify which tools to register. If not provided, all tools are registered.",
     )
@@ -242,6 +243,7 @@ def main():
         "contacts": lambda: import_module("gcontacts.contacts_tools"),
         "search": lambda: import_module("gsearch.search_tools"),
         "appscript": lambda: import_module("gappsscript.apps_script_tools"),
+        "system": lambda: import_module("system.local_tools"),
     }
 
     tool_icons = {
@@ -257,6 +259,7 @@ def main():
         "contacts": "👤",
         "search": "🔍",
         "appscript": "📜",
+        "system": "🖥️",
     }
 
     # Determine which tools to import based on arguments

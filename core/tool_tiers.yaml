@@ -12,6 +12,7 @@ gmail:
     - list_gmail_labels
     - manage_gmail_label
     - draft_gmail_message
+    - export_gmail_message
 
   complete:
     - get_gmail_threads_content_batch

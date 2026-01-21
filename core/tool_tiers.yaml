@@ -13,6 +13,7 @@ gmail:
     - manage_gmail_label
     - draft_gmail_message
     - export_gmail_message
+    - get_gmail_message_visual
 
   complete:
     - get_gmail_threads_content_batch
@@ -34,6 +35,7 @@ drive:
     - remove_drive_permission
     - transfer_drive_ownership
     - batch_share_drive_file
+    - get_drive_file_visual
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access
@@ -143,3 +145,10 @@ search:
     - search_custom_siterestrict
   complete:
     - get_search_engine_info
+
+system:
+  core:
+
+  extended:
+    - get_local_file_visual
+  complete: []

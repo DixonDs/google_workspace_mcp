@@ -104,6 +104,7 @@ def main():
             "slides",
             "tasks",
             "search",
+            "system",
         ],
         help="Specify which tools to register. If not provided, all tools are registered.",
     )
@@ -184,6 +185,7 @@ def main():
         "slides": lambda: import_module("gslides.slides_tools"),
         "tasks": lambda: import_module("gtasks.tasks_tools"),
         "search": lambda: import_module("gsearch.search_tools"),
+        "system": lambda: import_module("system.local_tools"),
     }
 
     tool_icons = {
@@ -197,6 +199,7 @@ def main():
         "slides": "🖼️",
         "tasks": "✓",
         "search": "🔍",
+        "system": "🖥️",
     }
 
     # Determine which tools to import based on arguments

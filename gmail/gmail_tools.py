@@ -790,19 +790,21 @@ async def export_gmail_message(
     service, 
     message_id: str, 
     user_google_email: str, 
-    format: Literal["html", "eml"] = "html", 
+    format: Literal["html", "eml", "pdf", "png"] = "html", 
     output_path: Optional[str] = None
 ) -> str:
     """
-    Exports a Gmail message to a local file (HTML or EML).
+    Exports a Gmail message to a local file (HTML, EML, PDF, or PNG).
     
     - 'html': Save as a single HTML file with embedded images and visible metadata headers.
     - 'eml': Download the original raw email message (perfect for archiving or opening in desktop clients).
+    - 'pdf': Render the email as a PDF file.
+    - 'png': Render the email as a PNG image (stitched if multiple pages).
 
     Args:
         message_id (str): The unique ID of the Gmail message to retrieve.
         user_google_email (str): The user's Google email address. Required.
-        format (Literal["html", "eml"]): Output format. Defaults to "html".
+        format (Literal["html", "eml", "pdf", "png"]): Output format. Defaults to "html".
         output_path (Optional[str]): Path to save the file.
             - If None: Saves to OS temp dir with name "YYYY-MM-DD-Subject.ext".
             - If directory: Saves to that directory with default filename.
@@ -817,10 +819,10 @@ async def export_gmail_message(
     )
 
     # Validate format
-    if format not in ["html", "eml"]:
-        raise ValueError("Invalid format. Must be 'html' or 'eml'.")
+    if format not in ["html", "eml", "pdf", "png"]:
+        raise ValueError("Invalid format. Must be 'html', 'eml', 'pdf', or 'png'.")
 
-    file_ext = "html" if format == "html" else "eml"
+    file_ext = format
     
     # We need headers for filename generation in both cases (to get Subject and Date)
     # Fetch metadata first
@@ -858,7 +860,7 @@ async def export_gmail_message(
             f.write(eml_bytes)
             
     else:
-        # HTML Export: Archival format with embedded images
+        # HTML/PDF/PNG Export: Use Archival format with embedded images
         # 1. Fetch Full Payload
         message_full = await asyncio.to_thread(
             service.users()
@@ -872,7 +874,8 @@ async def export_gmail_message(
         bodies = _extract_message_bodies(payload)
         html_body = bodies.get("html", "") or f"<pre>{bodies.get('text', '')}</pre>"
         
-        # 3. Always Embed Images for archival
+        # 3. Always Embed Images (CID -> Data URI)
+        # This is critical for single-file HTML and WeasyPrint
         html_body = await asyncio.to_thread(
             _embed_inline_images, html_body, payload, service, message_id
         )
@@ -883,10 +886,63 @@ async def export_gmail_message(
         # 5. Wrap in viewer template
         final_html = _create_archival_html(all_headers, html_body)
         
-        with open(final_path, "w", encoding="utf-8") as f:
-            f.write(final_html)
+        if format == "html":
+            with open(final_path, "w", encoding="utf-8") as f:
+                f.write(final_html)
+        
+        elif format == "pdf":
+            try:
+                import weasyprint
+            except ImportError:
+                raise ImportError("weasyprint is required for PDF export. Please install it.")
+            
+            # WeasyPrint to PDF
+            # Use asyncio.to_thread because weasyprint can be slow/blocking
+            await asyncio.to_thread(
+                weasyprint.HTML(string=final_html).write_pdf, final_path, presentational_hints=True
+            )
+            
+        elif format == "png":
+            try:
+                import weasyprint
+                from pdf2image import convert_from_bytes
+                from PIL import Image
+            except ImportError:
+                raise ImportError("weasyprint, pdf2image, and pillow are required for PNG export.")
 
-    return f"Successfully exported email to: {final_path}"
+            # 1. Render to PDF bytes first
+            # WeasyPrint to PDF bytes
+            pdf_bytes = await asyncio.to_thread(
+                weasyprint.HTML(string=final_html).write_pdf, presentational_hints=True
+            )
+            
+            # 2. Convert PDF to Images
+            try:
+                images = await asyncio.to_thread(convert_from_bytes, pdf_bytes)
+            except Exception as e:
+                raise RuntimeError(f"Failed to convert PDF to Image. Ensure Poppler is installed. Error: {e}")
+
+            if not images:
+                raise RuntimeError("No images generated from PDF.")
+
+            # 3. Stitch images if multiple
+            if len(images) == 1:
+                final_image = images[0]
+            else:
+                total_width = max(img.width for img in images)
+                total_height = sum(img.height for img in images)
+                final_image = Image.new('RGB', (total_width, total_height), 'white')
+                
+                y_offset = 0
+                for img in images:
+                    final_image.paste(img, (0, y_offset))
+                    y_offset += img.height
+            
+            # 4. Save PNG
+            await asyncio.to_thread(final_image.save, final_path, format="PNG")
+
+    logger.info(f"[export_gmail_message] Saved to: {final_path}")
+    return f"Successfully saved message to: {final_path}"
 
 
 @server.tool()

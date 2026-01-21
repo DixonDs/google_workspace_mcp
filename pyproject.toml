@@ -21,6 +21,9 @@ dependencies = [
  "python-dotenv>=1.1.0",
  "pyyaml>=6.0.2",
  "cryptography>=45.0.0",
+ "weasyprint>=63.0",
+ "pdf2image>=1.17.0",
+ "pillow>=11.0.0",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

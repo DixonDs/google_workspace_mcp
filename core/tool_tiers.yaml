@@ -12,6 +12,7 @@ gmail:
     - list_gmail_labels
     - manage_gmail_label
     - draft_gmail_message
+    - export_gmail_message
     - list_gmail_filters
     - create_gmail_filter
     - delete_gmail_filter

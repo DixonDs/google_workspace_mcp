@@ -8,6 +8,13 @@ import logging
 import asyncio
 import base64
 import ssl
+import os
+import tempfile
+import re
+import email.utils
+import textwrap
+from datetime import datetime
+from html import escape
 import mimetypes
 from pathlib import Path
 from html.parser import HTMLParser
@@ -139,6 +146,62 @@ def _extract_message_bodies(payload):
             logger.warning(f"Failed to decode main payload body: {e}")
 
     return {"text": text_body, "html": html_body}
+
+
+def _embed_inline_images(html_body: str, payload: dict, service, message_id: str) -> str:
+    """
+    Replaces cid: references in HTML with base64 data URIs.
+    """
+    if not html_body:
+        return ""
+
+    # 1. Find all inline attachments (parts with Content-ID)
+    inline_map = {}
+
+    def walk_parts(parts):
+        for part in parts:
+            mime_type = part.get("mimeType", "")
+            headers = {h["name"].lower(): h["value"] for h in part.get("headers", [])}
+            content_id = headers.get("content-id")
+
+            if content_id and mime_type.startswith("image/"):
+                # Clean up ID: <image001> -> image001
+                cid = content_id.strip("<>")
+
+                # Get data (either in 'body.data' or via attachment fetch)
+                body = part.get("body", {})
+                data = body.get("data")
+
+                if not data and "attachmentId" in body:
+                    # We must fetch the attachment if data is missing (common for larger images)
+                    try:
+                        att = (
+                            service.users()
+                            .messages()
+                            .attachments()
+                            .get(userId="me", messageId=message_id, id=body["attachmentId"])
+                            .execute()
+                        )
+                        data = att.get("data")
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch inline image {cid}: {e}")
+
+                if data:
+                    # Convert to standard Base64 (Gmail uses URL-safe)
+                    b64_std = data.replace("-", "+").replace("_", "/")
+                    inline_map[cid] = f"data:{mime_type};base64,{b64_std}"
+
+            if "parts" in part:
+                walk_parts(part["parts"])
+
+    walk_parts([payload] if "parts" not in payload else payload.get("parts", []))
+
+    # 2. Replace in HTML
+    for cid, data_uri in inline_map.items():
+        # Handle both quoted and unquoted cid references
+        html_body = html_body.replace(f"cid:{cid}", data_uri)
+
+    return html_body
 
 
 def _format_body_content(text_body: str, html_body: str) -> str:
@@ -635,6 +698,287 @@ async def get_gmail_message_content(
             )
 
     return "\n".join(content_lines)
+
+
+    return "\n".join(content_lines)
+
+
+def _sanitize_filename(filename: str) -> str:
+    """
+    Sanitize a string to be safe for filenames on Windows and Linux.
+    Removes invalid characters and trims length.
+    """
+    # Remove invalid characters (Windows: < > : " / \ | ? *)
+    # Linux: technically only / is invalid, but we'll be conservative
+    sanitized = re.sub(r'[<>:"/\\|?*]', "", filename)
+    # Replace whitespace with underscores or hyphens (optional, but good practice)
+    sanitized = sanitized.strip().replace("\n", "").replace("\r", "")
+    return sanitized[:100]  # Limit length to avoid OS limits
+
+
+def _determine_output_path(
+    output_path: Optional[str], subject: str, date_str: str, ext: str
+) -> str:
+    """
+    Determine the final output path based on user input and message metadata.
+
+    Strategy:
+    1. If None: Use Default Dir + Default Name.
+    2. If "Directory-like" (Ends in / or exists as dir): Use Provided Dir + Default Name.
+    3. If "Filename-like" (No path separators): Use Default Dir + Provided Name.
+    4. If "Full Path" (Has separators, looks like file): Use exact path.
+
+    Default Dir: OS-specific temporary folder
+    Default Name: ISO8601Date-Subject.Format
+    """
+    # Parse date to ISO8601 (YYYY-MM-DD)
+    try:
+        parsed_date = email.utils.parsedate_to_datetime(date_str)
+        date_prefix = parsed_date.strftime("%Y-%m-%d")
+    except Exception:
+        # Fallback if date parsing fails
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+
+    safe_subject = _sanitize_filename(subject) or "No_Subject"
+    if not safe_subject:
+        safe_subject = "No_Subject"
+
+    default_filename = f"{date_prefix}-{safe_subject}.{ext}"
+    default_dir = tempfile.gettempdir()
+
+    if output_path is None:
+        # Case 1: Default Dir + Default Name
+        return os.path.join(default_dir, default_filename)
+
+    # Check if directory-like (ends in separator) or is an existing directory
+    if output_path.endswith(os.sep) or output_path.endswith("/") or os.path.isdir(output_path):
+        # Case 2: Provided Dir + Default Name
+        return os.path.join(output_path, default_filename)
+
+    # Check dividers to see if it looks like a full path
+    has_separator = os.sep in output_path or "/" in output_path
+
+    if not has_separator:
+        # Case 3: Filename-like -> Default Dir + Provided Name
+        # Ensure extension logic if user didn't provide it?
+        # For now, let's respect user input but ensure directory is absolute
+        return os.path.join(default_dir, output_path)
+    else:
+        # Case 4: Full Path
+        return os.path.abspath(output_path)
+
+
+def _create_archival_html(headers: dict, body_html: str) -> str:
+    """
+    Wraps email body in a print-ready HTML template.
+    Uses CSS Scaling (transform) to emulate 'Shrink to Fit' without breaking layout.
+    """
+    subject = headers.get("Subject", "(No Subject)")
+    from_addr = headers.get("From", "Unknown")
+    to_addr = headers.get("To", "")
+    cc_addr = headers.get("Cc", "")
+    date = headers.get("Date", "")
+    msg_id = headers.get("Message-ID", "")
+
+    cc_html = ""
+    if cc_addr:
+        cc_html = f'''
+        <div class="mcp-row">
+            <span class="mcp-label">Cc:</span>
+            <span class="mcp-value">{escape(cc_addr)}</span>
+        </div>'''
+
+    html_template = textwrap.dedent(f"""\
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>{escape(subject)}</title>
+        <style>
+            /* 1. PAPER SETUP */
+            @page {{ size: A4; margin: 10mm; }}
+
+            body {{ 
+                margin: 0; padding: 0; background: #fff; 
+                -webkit-print-color-adjust: exact; 
+            }}
+            
+            /* 2. HEADER (Keeps original clean style) */
+            #mcp-header {{
+                font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+                font-size: 13px; line-height: 1.4; color: #333;
+                background: #f8f9fa; border-bottom: 2px solid #e0e0e0;
+                padding: 15px; margin-bottom: 10px; page-break-inside: avoid;
+            }}
+            .mcp-subject {{ 
+                font-size: 16px; font-weight: 700; margin-bottom: 10px; 
+                color: #202124; font-family: 'Google Sans', Roboto, Arial, sans-serif; 
+            }}
+            .mcp-row {{ display: flex; margin-bottom: 4px; }}
+            .mcp-label {{ 
+                font-weight: 700; color: #5f6368; min-width: 60px; 
+                display: inline-block; text-decoration: none; 
+            }}
+            .mcp-value {{ word-break: break-word; }}
+            .mcp-meta-id {{ 
+                font-size: 9px; color: #9aa0a6; margin-top: 10px; 
+                font-family: monospace; user-select: all; 
+            }}
+
+            /* 3. SHRINK-TO-FIT CONTAINER */
+            #mcp-mail-body {{
+                /* SCALE FIX: Transform content to 85% size.
+                   This makes a 800px wide email fit into ~680px A4 space.
+                */
+                transform: scale(0.85); 
+                transform-origin: top left;
+                
+                /* Compensate width: 100% / 0.85 = ~117% */
+                width: 117%; 
+                
+                padding: 0 10px; 
+                box-sizing: border-box;
+                font-family: Arial, sans-serif; 
+                font-size: 13px; /* Base font size */
+                line-height: normal;
+                color: #000; text-align: left;
+            }}
+
+            /* 4. LAYOUT SAFETY (Removed destructive 'width: auto') */
+            #mcp-mail-body img {{ max-width: 100%; height: auto; }}
+            
+            /* Only force max-width, NEVER force 'width: auto' or 'width: 100%' on tables
+               as it breaks fixed-width email layouts. */
+            #mcp-mail-body table {{ max-width: 100%; }}
+            
+            #mcp-mail-body a {{ word-wrap: break-word; }}
+            
+            @media print {{ .no-print {{ display: none !important; }} }}
+        </style>
+    </head>
+    <body>
+        <div id="mcp-header">
+            <div class="mcp-subject">{escape(subject)}</div>
+            <div class="mcp-row"><span class="mcp-label">From:</span><span class="mcp-value">{escape(from_addr)}</span></div>
+            <div class="mcp-row"><span class="mcp-label">To:</span><span class="mcp-value">{escape(to_addr)}</span></div>
+            {cc_html}
+            <div class="mcp-row"><span class="mcp-label">Date:</span><span class="mcp-value">{escape(date)}</span></div>
+            <div class="mcp-meta-id">Message-ID: {escape(msg_id)}</div>
+        </div>
+        
+        <div id="mcp-mail-body">
+            {body_html}
+        </div>
+    </body>
+    </html>""")
+
+    return html_template
+
+
+@server.tool()
+@handle_http_errors("export_gmail_message", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def export_gmail_message(
+    service,
+    message_id: str,
+    user_google_email: str,
+    format: Literal["html", "eml"] = "html",
+    output_path: Optional[str] = None
+) -> str:
+    """
+    Exports a Gmail message to a local file (HTML or EML).
+
+    - 'html': Save as a single HTML file with embedded images and visible metadata headers.
+    - 'eml': Download the original raw email message (perfect for archiving or opening in desktop clients).
+
+    Args:
+        message_id (str): The unique ID of the Gmail message to retrieve.
+        user_google_email (str): The user's Google email address. Required.
+        format (Literal["html", "eml"]): Output format. Defaults to "html".
+        output_path (Optional[str]): Path to save the file.
+            - If None: Saves to OS temp dir with name "YYYY-MM-DD-Subject.ext".
+            - If directory: Saves to that directory with default filename.
+            - If filename: Saves to OS temp dir with that filename.
+            - If full path: Saves to exact path.
+
+    Returns:
+        str: Success message with the absolute path of the saved file.
+    """
+    logger.info(
+        f"[export_gmail_message] Invoked. Message ID: '{message_id}', Format: '{format}'"
+    )
+
+    # Validate format
+    if format not in ["html", "eml"]:
+        raise ValueError("Invalid format. Must be 'html' or 'eml'.")
+
+    file_ext = "html" if format == "html" else "eml"
+
+    # We need headers for filename generation in both cases (to get Subject and Date)
+    # Fetch metadata first
+    message_meta = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="metadata", metadataHeaders=["Subject", "Date"])
+        .execute
+    )
+
+    headers_list = message_meta.get("payload", {}).get("headers", [])
+    headers_dict = {h["name"]: h["value"] for h in headers_list}
+    subject = headers_dict.get("Subject", "No Subject")
+    date_str = headers_dict.get("Date", "")
+
+    # Determine output path
+    final_path = _determine_output_path(output_path, subject, date_str, file_ext)
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+
+    if format == "eml":
+        # EML Export: Download raw message
+        message_raw = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="raw")
+            .execute
+        )
+        raw_data = message_raw.get("raw", "")
+        # Decode base64url to bytes
+        eml_bytes = base64.urlsafe_b64decode(raw_data)
+
+        with open(final_path, "wb") as f:
+            f.write(eml_bytes)
+
+    else:
+        # HTML Export: Archival format with embedded images
+        # 1. Fetch Full Payload
+        message_full = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute
+        )
+        payload = message_full.get("payload", {})
+
+        # 2. Extract HTML
+        bodies = _extract_message_bodies(payload)
+        html_body = bodies.get("html", "") or f"<pre>{bodies.get('text', '')}</pre>"
+
+        # 3. Always Embed Images for archival
+        html_body = await asyncio.to_thread(
+            _embed_inline_images, html_body, payload, service, message_id
+        )
+
+        # 4. Get all headers for display
+        all_headers = _extract_headers(payload, GMAIL_METADATA_HEADERS)
+
+        # 5. Wrap in viewer template
+        final_html = _create_archival_html(all_headers, html_body)
+
+        with open(final_path, "w", encoding="utf-8") as f:
+            f.write(final_html)
+
+    return f"Successfully exported email to: {final_path}"
 
 
 @server.tool()

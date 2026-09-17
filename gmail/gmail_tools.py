@@ -19,9 +19,11 @@ from urllib.parse import unquote, urlparse, urlunsplit
 
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import formataddr
+from email.utils import formataddr, parsedate_to_datetime
+from datetime import datetime, timezone
 
 import httpx
+from googleapiclient.errors import HttpError
 from fastmcp.exceptions import ToolError as ToolExecutionError
 from mcp.types import ToolAnnotations
 
@@ -47,6 +49,17 @@ from core.config import (
     WORKSPACE_MCP_PORT,
 )
 from core.http_utils import ssrf_safe_stream
+from core.export_paths import (
+    resolve_output_path,
+    sanitize_export_filename,
+    write_export,
+)
+from core.visual_rendering import (
+    describe_rendering_error,
+    html_to_pdf_bytes,
+    html_to_png_bytes,
+    render_document_page,
+)
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     handle_http_errors,
@@ -546,6 +559,279 @@ async def _export_full_message(
         f"({extension.lstrip('.')}) to {saved.path}"
     )
     return "\n".join(result_lines)
+
+
+# Inline images referenced from HTML as ``cid:<Content-ID>`` (RFC 2392). The
+# lookahead stops ``cid:logo`` from also matching inside ``cid:logo2``.
+def _cid_reference_pattern(cid: str) -> "re.Pattern[str]":
+    return re.compile(rf"cid:{re.escape(cid)}(?=[\"'\s)>]|$)")
+
+
+async def _embed_inline_images(
+    service, message_id: str, payload: dict, html_body: str
+) -> tuple[str, List[str]]:
+    """
+    Replace ``cid:`` image references in an HTML body with base64 data URIs so the
+    exported document is self-contained.
+
+    Walks the MIME tree for image parts carrying a ``Content-ID`` header. Small parts
+    arrive with their data inline; larger ones only carry an ``attachmentId`` and are
+    fetched from the Gmail API. Parts that fail to fetch are left as ``cid:`` links and
+    reported in the returned notes rather than failing the whole export.
+
+    Args:
+        service: Authenticated Gmail API service.
+        message_id: The message the payload belongs to.
+        payload: The ``format="full"`` message payload.
+        html_body: The HTML body to rewrite.
+
+    Returns:
+        (rewritten_html, notes) — notes list any images that could not be embedded.
+    """
+    if not html_body or "cid:" not in html_body:
+        return html_body, []
+
+    inline_parts: List[tuple[str, str, dict]] = []
+
+    def _collect(part: dict) -> None:
+        mime_type = part.get("mimeType", "")
+        headers = {
+            h.get("name", "").lower(): h.get("value", "")
+            for h in part.get("headers", [])
+        }
+        content_id = headers.get("content-id", "").strip().strip("<>").strip()
+        if content_id and mime_type.startswith("image/"):
+            inline_parts.append((content_id, mime_type, part.get("body", {})))
+        for sub_part in part.get("parts", []):
+            _collect(sub_part)
+
+    _collect(payload)
+
+    notes: List[str] = []
+    for cid, mime_type, body in inline_parts:
+        pattern = _cid_reference_pattern(cid)
+        if not pattern.search(html_body):
+            continue  # Declared but never referenced; nothing to rewrite.
+
+        data = body.get("data")
+        if not data and body.get("attachmentId"):
+            try:
+                attachment = await asyncio.to_thread(
+                    service.users()
+                    .messages()
+                    .attachments()
+                    .get(userId="me", messageId=message_id, id=body["attachmentId"])
+                    .execute
+                )
+                data = attachment.get("data")
+            except HttpError as exc:
+                logger.warning(
+                    f"[gmail export] Failed to fetch inline image cid={cid!r}: {exc}"
+                )
+        if not data:
+            notes.append(f"Inline image '{cid}' could not be embedded.")
+            continue
+
+        # Gmail returns URL-safe base64; data URIs need the standard alphabet.
+        try:
+            image_bytes = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+        except (binascii.Error, ValueError):
+            notes.append(f"Inline image '{cid}' had undecodable data.")
+            continue
+        data_uri = (
+            f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        )
+        html_body = pattern.sub(lambda _m, uri=data_uri: uri, html_body)
+
+    return html_body, notes
+
+
+def _build_archival_html(headers: Dict[str, str], body_html: str) -> str:
+    """
+    Wrap an email body in a self-contained, print-ready HTML document.
+
+    A header block shows the key message metadata above the body; the body itself is
+    reproduced as-is (it is the sender's HTML — the export is meant to be faithful,
+    not sanitised) inside a container scaled to fit an A4 page.
+
+    Args:
+        headers: Message headers (Subject, From, To, Cc, Date, Message-ID).
+        body_html: The (already image-embedded) HTML body.
+
+    Returns:
+        str: A complete HTML document.
+    """
+
+    def _row(label: str, value: str) -> str:
+        if not value:
+            return ""
+        return (
+            f'<div class="mcp-row"><span class="mcp-label">{label}</span>'
+            f'<span class="mcp-value">{html.escape(value)}</span></div>'
+        )
+
+    subject = headers.get("Subject", "") or "(No Subject)"
+    rows = "".join(
+        [
+            _row("From:", headers.get("From", "")),
+            _row("To:", headers.get("To", "")),
+            _row("Cc:", headers.get("Cc", "")),
+            _row("Date:", headers.get("Date", "")),
+        ]
+    )
+    message_id = headers.get("Message-ID", "")
+    message_id_html = (
+        f'<div class="mcp-meta-id">Message-ID: {html.escape(message_id)}</div>'
+        if message_id
+        else ""
+    )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>{html.escape(subject)}</title>
+<style>
+  @page {{ size: A4; margin: 10mm; }}
+  body {{ margin: 0; padding: 0; background: #fff; -webkit-print-color-adjust: exact; }}
+  #mcp-header {{
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 13px; line-height: 1.4; color: #333;
+    background: #f8f9fa; border-bottom: 2px solid #e0e0e0;
+    padding: 15px; margin-bottom: 10px; page-break-inside: avoid;
+  }}
+  .mcp-subject {{ font-size: 16px; font-weight: 700; margin-bottom: 10px; color: #202124; }}
+  .mcp-row {{ display: flex; margin-bottom: 4px; }}
+  .mcp-label {{ font-weight: 700; color: #5f6368; min-width: 60px; display: inline-block; }}
+  .mcp-value {{ word-break: break-word; }}
+  .mcp-meta-id {{ font-size: 9px; color: #9aa0a6; margin-top: 10px; font-family: monospace; }}
+  /* Shrink-to-fit: scale the body so a typical 800px-wide email fits an A4 page.
+     Only cap widths — never force width on tables, which breaks fixed layouts. */
+  #mcp-mail-body {{
+    transform: scale(0.85); transform-origin: top left; width: 117%;
+    padding: 0 10px; box-sizing: border-box;
+    font-family: Arial, sans-serif; font-size: 13px; color: #000; text-align: left;
+  }}
+  #mcp-mail-body img {{ max-width: 100%; height: auto; }}
+  #mcp-mail-body table {{ max-width: 100%; }}
+  #mcp-mail-body a {{ word-wrap: break-word; }}
+</style>
+</head>
+<body>
+<div id="mcp-header">
+  <div class="mcp-subject">{html.escape(subject)}</div>
+  {rows}
+  {message_id_html}
+</div>
+<div id="mcp-mail-body">
+{body_html}
+</div>
+</body>
+</html>
+"""
+
+
+def _export_filename(headers: Dict[str, str], extension: str) -> str:
+    """
+    Build an archival filename: ``YYYY-MM-DD-<subject><extension>``.
+
+    The date comes from the message's ``Date`` header so exports sort
+    chronologically; it falls back to today if the header is missing or unparsable.
+    The subject is capped so a pathologically long Subject can't overflow filesystem
+    limits, and characters that are invalid in filenames are dropped.
+    """
+    date_prefix = ""
+    date_header = headers.get("Date", "")
+    if date_header:
+        try:
+            date_prefix = parsedate_to_datetime(date_header).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, IndexError):
+            pass
+    if not date_prefix:
+        date_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    subject = sanitize_export_filename(
+        (headers.get("Subject", "") or "")[:80], fallback="No_Subject"
+    )
+    return f"{date_prefix}-{subject}{extension}"
+
+
+async def _fetch_message_headers(
+    service, message_id: str
+) -> tuple[Dict[str, str], Optional[int]]:
+    """Fetch a message's display headers and Gmail's sizeEstimate in one metadata call."""
+    message_metadata = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=GMAIL_METADATA_HEADERS,
+        )
+        .execute
+    )
+    headers = _extract_headers(
+        message_metadata.get("payload", {}), GMAIL_METADATA_HEADERS
+    )
+    return headers, message_metadata.get("sizeEstimate")
+
+
+async def _fetch_raw_message_bytes(service, message_id: str) -> bytes:
+    """Download the byte-exact RFC 5322 message (what an .eml file contains)."""
+    message_raw = await asyncio.to_thread(
+        service.users().messages().get(userId="me", id=message_id, format="raw").execute
+    )
+    raw_data = message_raw.get("raw", "")
+    if not raw_data:
+        raise ValueError("Message has no raw content to export.")
+    padded_raw = raw_data + "=" * (-len(raw_data) % 4)
+    try:
+        return base64.urlsafe_b64decode(padded_raw)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Failed to decode raw MIME content: {exc}") from exc
+
+
+async def _build_printable_message_html(
+    service, message_id: str, headers: Dict[str, str]
+) -> tuple[str, List[str]]:
+    """
+    Produce the self-contained "archival" HTML document for a message: metadata
+    header block + body with inline images embedded as data URIs.
+
+    This single representation feeds the HTML, PDF and PNG exports and the visual
+    inspection tool, so all of them look the same.
+
+    Returns:
+        (html_document, notes) — notes list degraded cases (plaintext fallback,
+        images that could not be embedded).
+
+    Raises:
+        ValueError: If the message has no readable body at all.
+    """
+    message_full = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute
+    )
+    payload = message_full.get("payload", {})
+    bodies = _extract_message_bodies(payload)
+    html_body = bodies.get("html", "")
+    text_body = bodies.get("text", "")
+
+    notes: List[str] = []
+    if html_body.strip():
+        html_body, notes = await _embed_inline_images(
+            service, message_id, payload, html_body
+        )
+    elif text_body.strip():
+        html_body = f"<pre>{html.escape(text_body)}</pre>"
+        notes.append("No HTML body present; rendered the plaintext body instead.")
+    else:
+        raise ValueError("Message has no readable body content to export.")
+
+    return _build_archival_html(headers, html_body), notes
 
 
 def _build_message_get_request(
@@ -1897,6 +2183,230 @@ async def get_gmail_message_content(
             )
 
     return "\n".join(content_lines)
+
+
+EXPORT_FORMAT_EXTENSIONS = {
+    "html": ".html",
+    "eml": ".eml",
+    "pdf": ".pdf",
+    "png": ".png",
+}
+
+
+@server.tool(
+    title="Export Gmail Message",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("export_gmail_message", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def export_gmail_message(
+    service,
+    message_id: str,
+    user_google_email: str,
+    format: Annotated[
+        Literal["html", "eml", "pdf", "png"],
+        Field(
+            description=(
+                "Output format. 'html' (default): single self-contained HTML file with "
+                "a metadata header and inline images embedded. 'eml': the original "
+                "RFC 5322 message for archiving or desktop mail clients. 'pdf': the "
+                "same document rendered to PDF (A4). 'png': the PDF pages stitched "
+                "into one tall PNG image."
+            ),
+        ),
+    ] = "html",
+    output_path: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Where to save the file. Omit to save to the export directory "
+                "(WORKSPACE_MCP_EXPORT_DIR, else the OS temp dir) as "
+                "'YYYY-MM-DD-<subject>.<ext>'. A directory (trailing '/' or existing "
+                "folder) keeps that default name inside it; a bare filename goes into "
+                "the export directory; any other path is used exactly as given."
+            ),
+        ),
+    ] = None,
+) -> str:
+    """
+    Exports a Gmail message to a local file as HTML, EML, PDF or PNG.
+
+    - 'html': self-contained HTML with visible metadata headers and embedded images.
+    - 'eml': the original raw message (perfect for archiving or opening in a mail client).
+    - 'pdf': print-ready A4 PDF rendered from the HTML document (requires WeasyPrint).
+    - 'png': all PDF pages stitched vertically into one PNG (requires WeasyPrint + Poppler).
+
+    Args:
+        message_id (str): The unique ID of the Gmail message to export.
+        user_google_email (str): The user's Google email address. Required.
+        format (Literal["html", "eml", "pdf", "png"]): Output format. Defaults to "html".
+        output_path (Optional[str]): Path to save the file.
+            - If None: export directory with name "YYYY-MM-DD-Subject.ext".
+            - If directory: that directory with the default filename.
+            - If bare filename: export directory with that filename.
+            - If full path: exactly that path.
+
+    Returns:
+        str: Confirmation with the absolute path of the saved file, its size, and
+            any notes (e.g. images that could not be embedded), or an "Error:" string.
+    """
+    logger.info(
+        f"[export_gmail_message] Invoked. Message ID: '{message_id}', "
+        f"Email: '{user_google_email}', format='{format}', output_path={output_path!r}"
+    )
+
+    extension = EXPORT_FORMAT_EXTENSIONS.get(format)
+    if extension is None:
+        raise UserInputError(
+            "Invalid format. Must be one of 'html', 'eml', 'pdf', or 'png'."
+        )
+
+    headers, declared_size = await _fetch_message_headers(service, message_id)
+    subject = headers.get("Subject", "message") or "message"
+
+    # Gmail's full/raw endpoints return the payload as one JSON response, so honour
+    # WORKSPACE_MCP_MAX_FILE_BYTES (when set) before buffering an oversized message.
+    try:
+        ensure_within_file_size_limit(
+            declared_size, file_name=subject, file_id=message_id, kind="message export"
+        )
+    except FileTooLargeError as exc:
+        return str(exc)
+
+    try:
+        final_path = resolve_output_path(
+            output_path, _export_filename(headers, extension)
+        )
+    except ValueError as exc:
+        raise UserInputError(str(exc)) from exc
+
+    notes: List[str] = []
+    try:
+        if format == "eml":
+            content = await _fetch_raw_message_bytes(service, message_id)
+        else:
+            document, notes = await _build_printable_message_html(
+                service, message_id, headers
+            )
+            if format == "html":
+                content = document.encode("utf-8")
+            elif format == "pdf":
+                content = await html_to_pdf_bytes(document)
+            else:  # png
+                content = await html_to_png_bytes(document)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except Exception as exc:  # rendering toolchain problems
+        logger.error(f"[export_gmail_message] Rendering failed: {exc}")
+        return describe_rendering_error(exc)
+
+    try:
+        ensure_within_file_size_limit(
+            len(content), file_name=subject, file_id=message_id, kind="message export"
+        )
+    except FileTooLargeError as exc:
+        return str(exc)
+
+    try:
+        await asyncio.to_thread(write_export, final_path, content)
+    except OSError as exc:
+        logger.error(f"[export_gmail_message] Failed to write {final_path}: {exc}")
+        return f"Error: failed to write export to '{final_path}': {exc}"
+
+    size_kb = len(content) / 1024
+    lines = [
+        f"Successfully saved message to: {final_path}",
+        f"Format: {format}",
+        f"Size: {size_kb:.1f} KB ({len(content)} bytes)",
+        f"Subject: {subject}",
+    ]
+    for note in notes:
+        lines.append(f"Note: {note}")
+    return "\n".join(lines)
+
+
+@server.tool(
+    title="Get Gmail Message Visual",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("get_gmail_message_visual", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def get_gmail_message_visual(
+    service,
+    user_google_email: str,
+    message_id: str,
+    page_number: Annotated[
+        int, Field(description="1-based page of the rendered A4 document.", ge=1)
+    ] = 1,
+    max_dimension: Annotated[
+        Optional[int],
+        Field(
+            description=(
+                "Optional cap on the returned image's width and height in pixels "
+                "(aspect ratio preserved)."
+            ),
+            ge=64,
+        ),
+    ] = None,
+) -> list:
+    """
+    Visually inspects a Gmail message by rendering it (as it would print) to an image.
+
+    Useful for multimodal agents to 'see' the email layout, images, and formatting
+    instead of reading extracted text. The message is laid out on A4 pages; request
+    further pages with page_number.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        message_id (str): The unique ID of the Gmail message.
+        page_number (int): The page number to render (default 1).
+        max_dimension (int): Optional maximum width or height of the returned image.
+
+    Returns:
+        list: [ImageContent, str] — the page image plus a footer with page info,
+            or a single "Error: ..." string.
+    """
+    logger.info(
+        f"[get_gmail_message_visual] Message ID: {message_id}, Page: {page_number}, "
+        f"Max Dim: {max_dimension}"
+    )
+
+    headers, declared_size = await _fetch_message_headers(service, message_id)
+    try:
+        ensure_within_file_size_limit(
+            declared_size,
+            file_name=headers.get("Subject", "message") or "message",
+            file_id=message_id,
+            kind="message render",
+        )
+    except FileTooLargeError as exc:
+        return [str(exc)]
+
+    try:
+        document, notes = await _build_printable_message_html(
+            service, message_id, headers
+        )
+        pdf_bytes = await html_to_pdf_bytes(document)
+        result = await render_document_page(pdf_bytes, page_number, max_dimension)
+    except ValueError as exc:
+        return [f"Error: {exc}"]
+    except Exception as exc:
+        logger.error(f"[get_gmail_message_visual] Rendering failed: {exc}")
+        return [describe_rendering_error(exc)]
+
+    if notes and len(result) > 1:
+        result[-1] = result[-1] + " " + " ".join(f"Note: {n}" for n in notes)
+    return result
 
 
 @server.tool(

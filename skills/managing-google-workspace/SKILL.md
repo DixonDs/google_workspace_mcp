@@ -73,6 +73,8 @@ For server options, transport, auth modes, tool filtering, and deployment: [refe
 | Read multiple emails | `get_gmail_messages_content_batch` |
 | Read a thread | `get_gmail_thread_content` |
 | Read multiple threads | `get_gmail_threads_content_batch` |
+| Save/convert an email to HTML, EML, PDF or PNG on disk | `export_gmail_message` |
+| Look at an email's rendered layout as an image | `get_gmail_message_visual` |
 | Send email (new or reply) | `send_gmail_message` |
 | Create draft | `draft_gmail_message` |
 | Download attachment | `get_gmail_attachment_content` |
@@ -93,6 +95,7 @@ For parameters: [references/gmail.md](references/gmail.md)
 | List items in folder | `list_drive_items` |
 | Read file content | `get_drive_file_content` |
 | Download file | `get_drive_file_download_url` |
+| Look at a file/doc/slide rendered as an image | `get_drive_file_visual` |
 | Create file | `create_drive_file` |
 | Create folder | `create_drive_folder` |
 | Copy file | `copy_drive_file` |
@@ -255,6 +258,12 @@ For parameters: [references/apps-script.md](references/apps-script.md)
 | Get search engine info | `get_search_engine_info` |
 
 For parameters: [references/search.md](references/search.md)
+
+### Local files (system service)
+
+| Task | Tool |
+|------|------|
+| Look at a local PDF, image, or HTML file (e.g. an export) as an image | `get_local_file_visual` |
 
 ### Auth
 

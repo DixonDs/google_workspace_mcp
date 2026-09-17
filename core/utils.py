@@ -173,30 +173,22 @@ def _get_allowed_file_dirs() -> list[Path]:
     return unique_dirs
 
 
-def validate_file_path(file_path: str) -> Path:
+def ensure_path_not_sensitive(resolved: Path) -> None:
     """
-    Validate that a file path is safe to read from the server filesystem.
+    Reject a canonical path that points at well-known secret/credential locations.
 
-    Resolves the path canonically (following symlinks), then verifies it falls
-    within one of the allowed base directories. Rejects paths to sensitive
-    system locations regardless of allowlist.
+    This is the allowlist-independent half of :func:`validate_file_path`; it is
+    also applied to paths the server *writes* (e.g. ``export_gmail_message``'s
+    ``output_path``) and to local files the visual tools render, where an
+    ALLOWED_FILE_DIRS-style allowlist would be too restrictive but reading or
+    clobbering ``~/.ssh`` must still be impossible.
 
     Args:
-        file_path: The raw file path string to validate.
-
-    Returns:
-        Path: The resolved, validated Path object.
+        resolved: An already-resolved (canonical) path.
 
     Raises:
-        ValueError: If the path is outside allowed directories or targets
-                    a sensitive location.
+        ValueError: If the path targets a sensitive location.
     """
-    resolved = Path(file_path).resolve()
-
-    if not resolved.exists():
-        raise FileNotFoundError(f"Path does not exist: {resolved}")
-
-    # Block sensitive file patterns regardless of allowlist
     resolved_str = str(resolved)
     file_name = resolved.name.lower()
 
@@ -268,6 +260,32 @@ def validate_file_path(file_path: str) -> Path:
             "this file commonly contains secrets or credentials."
         )
 
+
+def validate_file_path(file_path: str) -> Path:
+    """
+    Validate that a file path is safe to read from the server filesystem.
+
+    Resolves the path canonically (following symlinks), then verifies it falls
+    within one of the allowed base directories. Rejects paths to sensitive
+    system locations regardless of allowlist.
+
+    Args:
+        file_path: The raw file path string to validate.
+
+    Returns:
+        Path: The resolved, validated Path object.
+
+    Raises:
+        ValueError: If the path is outside allowed directories or targets
+                    a sensitive location.
+    """
+    resolved = Path(file_path).resolve()
+
+    if not resolved.exists():
+        raise FileNotFoundError(f"Path does not exist: {resolved}")
+
+    ensure_path_not_sensitive(resolved)
+
     allowed_dirs = _get_allowed_file_dirs()
     if not allowed_dirs:
         raise ValueError(
@@ -283,6 +301,7 @@ def validate_file_path(file_path: str) -> Path:
         except ValueError:
             continue
 
+    resolved_str = str(resolved)
     raise ValueError(
         f"Access to '{resolved_str}' is not allowed: "
         f"path is outside permitted directories ({', '.join(str(d) for d in allowed_dirs)}). "

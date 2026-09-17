@@ -226,6 +226,7 @@ SERVICE_MODULES = {
     "contacts": "gcontacts.contacts_tools",
     "search": "gsearch.search_tools",
     "appscript": "gappsscript.apps_script_tools",
+    "system": "system.local_tools",
 }
 VALID_SERVICES = frozenset(SERVICE_MODULES)
 
@@ -244,6 +245,7 @@ SERVICE_ICONS = {
     "contacts": "👤",
     "search": "🔍",
     "appscript": "📜",
+    "system": "💻",
 }
 
 
@@ -435,12 +437,48 @@ def _restore_stdout() -> None:
         print(captured, end="", file=sys.stderr)
 
 
+# macOS: WeasyPrint (PDF/PNG export, visual tools) loads Pango/Cairo through cffi by
+# bare library name, and dyld only searches DYLD_FALLBACK_LIBRARY_PATH when that
+# variable is set *at process start*. Homebrew's lib dir is not on the default
+# search path on Apple Silicon, so without this every MCP client config would have
+# to set the variable by hand. Re-exec once with it set when the libraries exist.
+_MACOS_NATIVE_LIB_DIRS = ("/opt/homebrew/lib", "/usr/local/lib")
+_REEXEC_MARKER = "WORKSPACE_MCP_DYLD_REEXEC"
+
+
+def _ensure_macos_native_library_path() -> None:
+    if sys.platform != "darwin" or os.environ.get(_REEXEC_MARKER):
+        return
+    if os.environ.get("WORKSPACE_MCP_DISABLE_DYLD_REEXEC"):
+        return
+    if os.environ.get("DYLD_FALLBACK_LIBRARY_PATH"):
+        return
+    lib_dirs = [
+        d
+        for d in _MACOS_NATIVE_LIB_DIRS
+        if os.path.exists(os.path.join(d, "libgobject-2.0.0.dylib"))
+    ]
+    if not lib_dirs:
+        return  # Pango not installed; nothing to gain from re-exec.
+    env = dict(os.environ)
+    # Keep dyld's built-in fallbacks after the Homebrew dirs.
+    env["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(
+        lib_dirs + [os.path.expanduser("~/lib"), "/usr/local/lib", "/usr/lib"]
+    )
+    env[_REEXEC_MARKER] = "1"
+    try:
+        os.execve(sys.executable, [sys.executable] + sys.argv, env)
+    except OSError:
+        return  # Fall through and run without the fix; tools report the error.
+
+
 def main():
     """
     Main entry point for the Google Workspace MCP server.
     Uses FastMCP's native streamable-http transport.
     """
     _restore_stdout()
+    _ensure_macos_native_library_path()
 
     # Configure safe logging for Windows Unicode handling
     configure_safe_logging()

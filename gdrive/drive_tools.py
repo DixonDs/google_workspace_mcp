@@ -9,7 +9,7 @@ import base64
 import logging
 import io
 
-from typing import Optional, List, Dict, Any
+from typing import Annotated, Optional, List, Dict, Any
 from tempfile import NamedTemporaryFile, SpooledTemporaryFile
 from urllib.parse import urlparse
 from urllib.request import url2pathname
@@ -20,6 +20,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
@@ -41,6 +42,11 @@ from core.utils import (
 )
 from core.server import server
 from core.config import get_transport_mode
+from core.visual_rendering import (
+    describe_rendering_error,
+    render_document_page,
+    render_image,
+)
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
     FOLDER_MIME_TYPE,
@@ -652,6 +658,104 @@ async def get_drive_file_download_url(
             f"File was downloaded successfully ({size_kb:.1f} KB) but could not be saved.\n\n"
             f"Error details: {str(e)}"
         )
+
+
+# Google-native types that Drive can export as PDF for rendering.
+_PDF_EXPORTABLE_GOOGLE_TYPES = {
+    "application/vnd.google-apps.document",
+    "application/vnd.google-apps.spreadsheet",
+    "application/vnd.google-apps.presentation",
+    "application/vnd.google-apps.drawing",
+}
+
+
+@server.tool(
+    title="Get Drive File Visual",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("get_drive_file_visual", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def get_drive_file_visual(
+    service,
+    user_google_email: str,
+    file_id: str,
+    page_number: Annotated[
+        int,
+        Field(description="1-based page to render. Ignored for images.", ge=1),
+    ] = 1,
+    max_dimension: Annotated[
+        Optional[int],
+        Field(
+            description=(
+                "Optional cap on the returned image's width and height in pixels "
+                "(aspect ratio preserved)."
+            ),
+            ge=64,
+        ),
+    ] = None,
+) -> list:
+    """
+    Visually inspects a Google Drive file by rendering it as an image.
+
+    Supports PDFs, images, and Google Docs/Sheets/Slides/Drawings (exported to PDF
+    first). Use page_number to page through multi-page documents.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The Google Drive file ID (shortcuts are resolved).
+        page_number (int): The page number to render (default 1). Ignored for images.
+        max_dimension (int): Optional maximum width or height of the returned image.
+
+    Returns:
+        list: [ImageContent, str] for documents (image + page footer), [ImageContent]
+            for images, or a single "Error: ..." string.
+    """
+    logger.info(
+        f"[get_drive_file_visual] File ID: {file_id}, Page: {page_number}, "
+        f"Max Dim: {max_dimension}"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service,
+        file_id,
+        extra_fields="name, mimeType, size, webViewLink",
+    )
+    file_id = resolved_file_id
+    mime_type = file_metadata.get("mimeType", "")
+    file_name = file_metadata.get("name", "Unknown File")
+
+    if mime_type in _PDF_EXPORTABLE_GOOGLE_TYPES:
+        export_mime_type = "application/pdf"
+    elif mime_type == "application/pdf" or mime_type.startswith("image/"):
+        export_mime_type = None
+    else:
+        return [
+            f"Error: '{file_name}' has type '{mime_type}', which cannot be rendered. "
+            "Supported: PDF, images, Google Docs/Sheets/Slides/Drawings."
+        ]
+
+    try:
+        file_bytes = await download_media_bytes(
+            _media_request(service, file_id, export_mime_type),
+            file_name=file_name,
+            file_id=file_id,
+            web_view_link=file_metadata.get("webViewLink"),
+        )
+    except FileTooLargeError as exc:
+        return [str(exc)]
+
+    try:
+        if mime_type.startswith("image/"):
+            return await render_image(file_bytes, max_dimension)
+        return await render_document_page(file_bytes, page_number, max_dimension)
+    except Exception as exc:
+        logger.error(f"[get_drive_file_visual] Rendering failed for {file_id}: {exc}")
+        return [describe_rendering_error(exc)]
 
 
 @server.tool(

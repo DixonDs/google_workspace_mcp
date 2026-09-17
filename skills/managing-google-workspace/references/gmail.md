@@ -3,7 +3,7 @@
 MCP tools for Gmail message search, sending, drafting, labels, and filters. All tools require `user_google_email` (string, required).
 
 ## Contents
-- Search & Read: search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, get_gmail_thread_content, get_gmail_threads_content_batch, get_gmail_attachment_content
+- Search & Read: search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, get_gmail_thread_content, get_gmail_threads_content_batch, get_gmail_attachment_content, export_gmail_message, get_gmail_message_visual
 - Send & Draft: send_gmail_message, draft_gmail_message
 - Label Management: list_gmail_labels, manage_gmail_label, modify_gmail_message_labels, batch_modify_gmail_message_labels
 - Filter Management: list_gmail_filters, manage_gmail_filter
@@ -64,6 +64,26 @@ Download an attachment to local disk (stdio mode) or get a temporary URL (HTTP m
 | message_id | string | yes | | |
 | attachment_id | string | yes | | |
 | user_google_email | string | yes | | |
+
+### export_gmail_message
+Save a message to the local filesystem as a self-contained HTML document (metadata header, inline images embedded), the original .eml, a PDF, or a PNG (pages stitched). PDF/PNG need WeasyPrint + Poppler on the server host.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| message_id | string | yes | | |
+| user_google_email | string | yes | | |
+| format | string | no | "html" | "html", "eml", "pdf", or "png" |
+| output_path | string | no | | Omit: export dir (WORKSPACE_MCP_EXPORT_DIR, else OS temp) + "YYYY-MM-DD-Subject.ext". Directory: that dir + default name. Bare filename: export dir + that name. Full path: used as-is |
+
+### get_gmail_message_visual
+Render a message (as it would print, A4) and return one page as an image so the model can see layout and images. Returns [image, footer text]; page through with `page_number`.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| message_id | string | yes | | |
+| page_number | integer | no | 1 | |
+| max_dimension | integer | no | | Cap on returned image width/height in px |
 
 ---
 

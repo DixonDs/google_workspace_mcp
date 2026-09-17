@@ -4,7 +4,7 @@ MCP tools for Google Drive file management, search, content retrieval, and permi
 
 ## Contents
 - Search & Browse: search_drive_files, list_drive_items
-- Content & Download: get_drive_file_content, get_drive_file_download_url
+- Content & Download: get_drive_file_content, get_drive_file_download_url, get_drive_file_visual
 - Create & Modify: create_drive_file, create_drive_folder, copy_drive_file, update_drive_file
 - Permissions & Sharing: set_drive_file_permissions, manage_drive_access, get_drive_file_permissions, get_drive_shareable_link, check_drive_file_public_access
 - Import: import_to_google_doc
@@ -77,6 +77,16 @@ Default export formats for Google native files:
 - Docs: PDF (or `docx`)
 - Sheets: XLSX (or `pdf`, `csv`)
 - Slides: PDF (or `pptx`)
+
+### get_drive_file_visual
+Render a Drive file as an image so the model can see it: PDFs and Google Docs/Sheets/Slides/Drawings (exported to PDF) one page at a time, images directly. Returns [image, footer text] for documents, [image] for images. Needs Poppler on the server host.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| file_id | string | yes | | Drive file ID (shortcuts resolved) |
+| page_number | integer | no | 1 | Ignored for images |
+| max_dimension | integer | no | | Cap on returned image width/height in px |
 
 ---
 
